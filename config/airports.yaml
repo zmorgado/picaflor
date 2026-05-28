@@ -1,0 +1,21 @@
+origins:
+  - MAD
+  - BRU
+  - BCN
+  - VAL
+
+destinations:
+  - LIS
+  - OPO
+  - FCO
+  - BER
+  - CDG
+  - VIE
+  - ATH
+
+defaults:
+  home_origin: BRU
+  window_days: 20
+  nights_min: 3
+  nights_max: 5
+  budget_eur: 120

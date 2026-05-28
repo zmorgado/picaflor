@@ -1,0 +1,49 @@
+services:
+  bot:
+    build: .
+    container_name: picaflor-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "-m", "app.bot"]
+
+    # The bot's main loop must `touch /app/data/bot.heartbeat` after each
+    # successful long-poll cycle. If the file is older than 120s, the bot
+    # is considered unhealthy and Docker will restart it.
+    healthcheck:
+      test: ["CMD-SHELL", "test $(($(date +%s) - $(stat -c %Y /app/data/bot.heartbeat 2>/dev/null || echo 0))) -lt 120"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    # Cap container stdout/stderr; app-level logs go to ./logs via
+    # RotatingFileHandler, this is just a belt-and-braces disk guard.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Invoked one-shot from host cron:
+  #   docker compose run --rm scanner
+  # Not started by `docker compose up` thanks to the profile.
+  scanner:
+    build: .
+    container_name: picaflor-scanner
+    profiles: ["scan"]
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "-m", "app.scanner"]
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
