@@ -112,16 +112,30 @@ if result is not None:
 
 
 # ----------------------------------------------------------------------
-# Block B — consent-cookie shim at the HTTP layer
+# Block B — the decisive test: known-good SOCS cookie at the HTTP layer
 # ----------------------------------------------------------------------
 # get_flights() has NO way to pass cookies (see core.py signature), and its
-# internal fetch() does a bare client.get with no cookies. So we reproduce the
-# same request at the low level and inject Cookies.new().to_dict() — the
-# CONSENT/SOCS pair Google sets after you accept the interstitial. If Block A
-# was walled but this returns flight HTML, the fix for v0.1 is a cookie shim.
-banner("BLOCK B — does a CONSENT/SOCS cookie get past the wall?")
+# internal fetch() builds a bare cookie-less primp Client. So we reproduce the
+# same request at the low level and inject a *specific, known-good* SOCS token
+# — the exact constant from upstream PR #108
+# (github.com/AWeirdDev/flights/pull/108), which proved this value bypasses the
+# "Before you continue to Google" consent wall. (Our earlier attempt used the
+# library's Cookies.new() — a dynamically built token Google evidently doesn't
+# honor; that's why it failed.)
+#
+# This isolates ONE variable: with a valid consent cookie, does THIS droplet IP
+# get real flight HTML, or a second IP-level block?
+#   - parseable flights  => IP is clean; the only fix needed is wiring this
+#                           cookie into the library (small, known change).
+#   - still walled / 0   => the IP itself is blocked; no library fix helps.
+banner("BLOCK B — known-good SOCS cookie: does THIS IP get real data?")
 
 from fast_flights.primp import Client  # noqa: E402
+from fast_flights.core import parse_response  # noqa: E402
+
+# Exact token from PR #108. Static (baked 2023) — works because Google's
+# consent tokens are long-lived; may rot eventually.
+SOCS = "CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODE1LjA3X3AxGgJlbiACGgYIgJnPpwY"
 
 tfs = TFSData.from_interface(
     flight_data=[FlightData(date=OUTBOUND, from_airport="MAD", to_airport="BCN")],
@@ -136,8 +150,7 @@ params = {
     "tfu": "EgQIABABIgA",
     "curr": "",
 }
-consent_cookies = Cookies.new(locale="en").to_dict()
-print("Injecting cookies:", list(consent_cookies.keys()))
+print("Injecting cookie: SOCS (known-good token from PR #108)")
 
 try:
     client = Client(impersonate="chrome_126", verify=False)
@@ -145,17 +158,32 @@ try:
     res = client.get(
         "https://www.google.com/travel/flights",
         params=params,
-        cookies=consent_cookies,
+        cookies={"SOCS": SOCS},
     )
     dt = time.perf_counter() - t1
     print(f"HTTP {res.status_code} in {dt:.2f}s")
+
     walled = looks_like_consent_wall(res.text_markdown)
-    print("Consent wall in response?", "YES (still blocked)" if walled else "no")
+    print("Still the consent wall?", "YES — IP appears blocked" if walled else "no — got past it")
+
     if not walled:
-        # Cheap heuristic: real results mention a price/duration grid class.
-        print("Response length:", len(res.text or ""))
-        print("Looks like it contains flight data?",
-              "eQ35Ce" in (res.text or "") or "$" in res.text_markdown or "€" in res.text_markdown)
+        # The real proof: can the library's own parser extract flights from
+        # this HTML? "Not a wall" isn't enough — it must be parseable data.
+        try:
+            parsed = parse_response(res)
+            flights = getattr(parsed, "flights", None)
+            n = len(flights) if flights else 0
+            print(f"parse_response() -> {n} flight(s); current_price={getattr(parsed, 'current_price', '?')}")
+            if n:
+                print("  VERDICT: droplet IP is CLEAN with a valid cookie. "
+                      "Fix = wire SOCS into the library. Scraper is viable.")
+                print("  sample:", repr(flights[0]))
+            else:
+                print("  Got non-wall HTML but 0 flights — possible soft block "
+                      "or parser drift. Inspect res.text_markdown.")
+        except Exception:
+            print("  parse_response() raised — not the wall, but unparseable:")
+            traceback.print_exc()
 except Exception:
     print("Low-level fetch raised:")
     traceback.print_exc()
