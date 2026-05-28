@@ -16,7 +16,6 @@ RUN uv sync --frozen --no-install-project --no-dev
 
 # Then the project itself
 COPY app/ ./app/
-COPY scripts/ ./scripts/
 RUN uv sync --frozen --no-dev
 
 # Overridden per-service in compose.yml
