@@ -1,24 +1,34 @@
 """
-Throwaway smoke test for fast-flights (v0.1 / step 4) — droplet edition.
+Throwaway smoke test for fast-flights — 3.0 / consent-fix edition.
 
-Run this FROM THE DIGITALOCEAN DROPLET, not locally. The whole point of the
-two-cloud split (CLAUDE.md) is that Google serves a cookie-consent / sign-in
-wall to flagged IPs. A local run on a residential/Homebrew IP already proved
-that: every live query came back as the "Before you continue to Google" page.
-This script re-runs the experiment from clean droplet egress and adds a
-consent-cookie shim to see if that alone gets us real flight HTML.
+WHY THIS EXISTS (the story so far):
+  - v2.2 (PyPI) is globally broken: Google now serves a "Before you continue"
+    consent wall to every request. Confirmed from the DO droplet: a raw curl
+    gets "Sign in" + a 302 to consent.google.com. Not our bug — a Google
+    change that broke all fast-flights users (see upstream PR #108).
+  - This script targets the 3.0rc1 API on thoughtpunch/flights@dev (commit
+    3c77b46, 2026-05-25), which carries the strongest fix available:
+      1. pre-sets a known-good SOCS consent cookie, AND
+      2. if the wall STILL appears, parses the consent form and POSTs
+         "Reject all" to consent.google.com/save, then retries — i.e. it
+         re-accepts consent the way a browser would, so it doesn't depend on
+         the (2023-era, possibly stale) hardcoded token holding up.
 
-It answers four questions:
-  A) Does the plain library call (fetch_mode="common") work from this IP?
-  B) Does injecting a CONSENT/SOCS cookie at the HTTP layer get past the wall?
-  C) Is there a cheapest-by-day "calendar" capability? (make-or-break for step 5)
-  D) Detection / cost signals: latency, consent wall, browser deps.
+THE ONE QUESTION THIS ANSWERS:
+  With proper consent handling, does THIS droplet IP get real, parseable
+  flight data — or is the IP itself blocked at a level no cookie can fix?
+    - flights returned   => IP is clean; the scraper path is viable on 3.0.
+    - FlightsError / wall => IP-level block; no library fix helps -> pivot.
 
-Why "common" and not "fallback": the hosted Playwright fallback service
-(try.playwright.tech) now returns 401 "no token provided", so fallback/
-force-fallback are dead in v2.2. Don't rely on them.
+INSTALL (on the droplet, experiment only — keep uncommitted):
+  uv add "fast-flights @ git+https://github.com/thoughtpunch/flights@dev"
+  docker build -t picaflor . && docker run --rm picaflor uv run python app/smoke.py
 
-Run with:  uv run python app/smoke.py
+NOTE: This uses the 3.0 API (create_query / FlightQuery / get_flights ->
+MetaList / FlightsError), which is INCOMPATIBLE with v2.2. If you run it on a
+2.2 install it will ImportError immediately — that means "wrong version
+installed", not "the fix failed".
+
 Delete once step 4 is done.
 """
 
@@ -32,186 +42,151 @@ def banner(title: str) -> None:
     print(f"\n{SEP}\n{title}\n{SEP}")
 
 
-def looks_like_consent_wall(text: str) -> bool:
-    """Google's GDPR interstitial, not flight data."""
-    if not text:
-        return False
-    markers = ("Before you continue to Google", "consent.google", "Sign in")
-    return any(m in text for m in markers)
-
-
 # ----------------------------------------------------------------------
-# Block 0 — what does the installed package actually expose?
+# Block 0 — environment + package surface (must be 3.0, not 2.2)
 # ----------------------------------------------------------------------
-banner("BLOCK 0 — package surface + environment sanity")
+banner("BLOCK 0 — environment + package surface (expect 3.0, NOT 2.2)")
 
 import sys  # noqa: E402
 
-print("Python:", sys.version.split()[0], "(CLAUDE.md pins 3.12 — flag if 3.14)")
+print("Python:", sys.version.split()[0])
 
 import fast_flights  # noqa: E402
 
-print("fast_flights version:", getattr(fast_flights, "__version__", "?? (expect 2.2)"))
+print("fast_flights version:", getattr(fast_flights, "__version__", "?? (expect 3.0rc1)"))
 print("\nTop-level names exported by fast_flights:")
 for name in sorted(n for n in dir(fast_flights) if not n.startswith("_")):
     print(f"  - {name}")
 
-from fast_flights import (  # noqa: E402
-    Cookies,
-    FlightData,
-    Passengers,
-    TFSData,
-    get_flights,
-)
+# 3.0 API. If any of these fail to import, you're on the wrong version.
+try:
+    from fast_flights import (  # noqa: E402
+        FlightQuery,
+        FlightsError,
+        Passengers,
+        create_query,
+        fetch_flights_html,
+        get_flights,
+    )
+    print("\n3.0 API imported OK (create_query / get_flights / FlightsError).")
+except ImportError:
+    print("\n!!! 3.0 API import FAILED — you are NOT on thoughtpunch@dev.")
+    print("    Install:  uv add 'fast-flights @ git+https://github.com/thoughtpunch/flights@dev'")
+    traceback.print_exc()
+    sys.exit(1)
 
-# ~1 month out from 'today' (2026-05-28). Adjust if you run this later.
+# ~1 month out from 'today' (2026-05-29). Adjust if you run this later.
 OUTBOUND = "2026-06-28"
 
 
+def build_query():
+    return create_query(
+        flights=[FlightQuery(date=OUTBOUND, from_airport="MAD", to_airport="BCN")],
+        seat="economy",
+        trip="one-way",
+        passengers=Passengers(adults=1),
+        language="en",
+        currency="",
+    )
+
+
 # ----------------------------------------------------------------------
-# Block A — plain library call from this IP (the baseline experiment)
+# Block A — the decisive test: does the consent fix get real data from THIS IP?
 # ----------------------------------------------------------------------
-banner("BLOCK A — plain get_flights(common) from THIS IP (MAD -> BCN)")
+# In 3.0 the consent handling is automatic inside fetch_flights_html (sets
+# SOCS, retries via reject-form if walled). So we just call get_flights — no
+# manual cookie injection needed. A FlightsError here is the library's own
+# signal that Google returned a wall / error / block.
+banner("BLOCK A — get_flights() with auto consent fix (MAD -> BCN)")
 
 t0 = time.perf_counter()
 result = None
 elapsed = 0.0
 try:
-    result = get_flights(
-        flight_data=[FlightData(date=OUTBOUND, from_airport="MAD", to_airport="BCN")],
-        trip="one-way",
-        seat="economy",
-        passengers=Passengers(adults=1),
-        fetch_mode="common",  # direct HTTP only; fallback service is dead (401)
-    )
+    result = get_flights(build_query())
     elapsed = time.perf_counter() - t0
-    print(f"OK — call returned in {elapsed:.2f}s")
+    n = len(result)
+    print(f"OK — returned in {elapsed:.2f}s with {n} flight(s)")
+    if n:
+        print("\n  VERDICT: droplet IP is CLEAN with consent handling. "
+              "Scraper path is VIABLE on 3.0. No pivot needed.")
+    else:
+        print("\n  Returned 0 flights but no error — possible soft block or "
+              "parser drift. Inspect Block B's raw HTML below.")
+except FlightsError:
+    elapsed = time.perf_counter() - t0
+    print(f"FlightsError after {elapsed:.2f}s — Google returned a wall/error/block.")
+    print("  This is the library telling us consent handling did not yield data.")
+    print("  VERDICT leaning: IP-level block (see Block B to confirm). Consider pivot.")
+    traceback.print_exc()
 except Exception:
     elapsed = time.perf_counter() - t0
-    print(f"FAILED after {elapsed:.2f}s")
-    print(
-        "If the traceback below shows a consent/sign-in page, this IP is being\n"
-        "walled (RC1). That's the make-or-break signal for the droplet.\n"
-    )
+    print(f"Unexpected exception after {elapsed:.2f}s:")
     traceback.print_exc()
 
-if result is not None:
-    flights = getattr(result, "flights", None)
-    print("\nresult.current_price:", getattr(result, "current_price", "<none>"))
-    print("number of flights:", len(flights) if flights is not None else "n/a")
-    if flights:
-        f0 = flights[0]
-        print("\nAttributes on a single flight:")
-        for name in sorted(n for n in dir(f0) if not n.startswith("_")):
-            value = getattr(f0, name, "<err>")
-            if not callable(value):
-                print(f"  - {name:20} = {value!r}")
-        print("\nFirst 3 flights (repr):")
-        for f in flights[:3]:
-            print(" ", repr(f))
+# Inspect the MetaList shape (3.0 differs from 2.2's Result object).
+if result is not None and len(result):
+    print("\nType of result:", type(result))
+    print("Metadata attrs on result:")
+    for name in sorted(n for n in dir(result) if not n.startswith("_")):
+        if name not in dir(list):  # only the metadata MetaList adds beyond list
+            val = getattr(result, name, "<err>")
+            if not callable(val):
+                print(f"  - {name} = {val!r}")
+    print("\nFirst result group (repr):")
+    print(" ", repr(result[0]))
 
 
 # ----------------------------------------------------------------------
-# Block B — the decisive test: known-good SOCS cookie at the HTTP layer
+# Block B — raw HTML: see exactly what Google served (wall vs data)
 # ----------------------------------------------------------------------
-# get_flights() has NO way to pass cookies (see core.py signature), and its
-# internal fetch() builds a bare cookie-less primp Client. So we reproduce the
-# same request at the low level and inject a *specific, known-good* SOCS token
-# — the exact constant from upstream PR #108
-# (github.com/AWeirdDev/flights/pull/108), which proved this value bypasses the
-# "Before you continue to Google" consent wall. (Our earlier attempt used the
-# library's Cookies.new() — a dynamically built token Google evidently doesn't
-# honor; that's why it failed.)
-#
-# This isolates ONE variable: with a valid consent cookie, does THIS droplet IP
-# get real flight HTML, or a second IP-level block?
-#   - parseable flights  => IP is clean; the only fix needed is wiring this
-#                           cookie into the library (small, known change).
-#   - still walled / 0   => the IP itself is blocked; no library fix helps.
-banner("BLOCK B — known-good SOCS cookie: does THIS IP get real data?")
-
-from fast_flights.primp import Client  # noqa: E402
-from fast_flights.core import parse_response  # noqa: E402
-
-# Exact token from PR #108. Static (baked 2023) — works because Google's
-# consent tokens are long-lived; may rot eventually.
-SOCS = "CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODE1LjA3X3AxGgJlbiACGgYIgJnPpwY"
-
-tfs = TFSData.from_interface(
-    flight_data=[FlightData(date=OUTBOUND, from_airport="MAD", to_airport="BCN")],
-    trip="one-way",
-    passengers=Passengers(adults=1),
-    seat="economy",
-    max_stops=None,
-)
-params = {
-    "tfs": tfs.as_b64().decode("utf-8"),
-    "hl": "en",
-    "tfu": "EgQIABABIgA",
-    "curr": "",
-}
-print("Injecting cookie: SOCS (known-good token from PR #108)")
+# fetch_flights_html returns the post-consent-handling HTML. This tells us
+# WHICH failure mode we're in if Block A came back empty/errored.
+banner("BLOCK B — raw HTML after consent handling (failure-mode diagnosis)")
 
 try:
-    client = Client(impersonate="chrome_126", verify=False)
-    t1 = time.perf_counter()
-    res = client.get(
-        "https://www.google.com/travel/flights",
-        params=params,
-        cookies={"SOCS": SOCS},
-    )
-    dt = time.perf_counter() - t1
-    print(f"HTTP {res.status_code} in {dt:.2f}s")
-
-    walled = looks_like_consent_wall(res.text_markdown)
-    print("Still the consent wall?", "YES — IP appears blocked" if walled else "no — got past it")
-
-    if not walled:
-        # The real proof: can the library's own parser extract flights from
-        # this HTML? "Not a wall" isn't enough — it must be parseable data.
-        try:
-            parsed = parse_response(res)
-            flights = getattr(parsed, "flights", None)
-            n = len(flights) if flights else 0
-            print(f"parse_response() -> {n} flight(s); current_price={getattr(parsed, 'current_price', '?')}")
-            if n:
-                print("  VERDICT: droplet IP is CLEAN with a valid cookie. "
-                      "Fix = wire SOCS into the library. Scraper is viable.")
-                print("  sample:", repr(flights[0]))
-            else:
-                print("  Got non-wall HTML but 0 flights — possible soft block "
-                      "or parser drift. Inspect res.text_markdown.")
-        except Exception:
-            print("  parse_response() raised — not the wall, but unparseable:")
-            traceback.print_exc()
+    html = fetch_flights_html(build_query())
+    print("HTML length:", len(html))
+    wall = "Before you continue" in html or "consent.google.com/save" in html
+    signin = "Sign in" in html and "travel/flights" not in html[:2000]
+    has_script = "ds:1" in html or 'script' in html and 'data:' in html
+    print("Still a consent wall?      ", "YES — IP/consent block survives the fix" if wall else "no")
+    print("Looks like a sign-in page? ", "yes" if signin else "no")
+    print("Has a flights data script? ", "yes (parseable data present)" if has_script else "no")
+    if wall:
+        print("\n  => The reject-form fallback did not clear the wall. Strong signal")
+        print("     this IP is blocked at a level no cookie fixes. Lean: PIVOT.")
+except FlightsError:
+    print("fetch_flights_html raised FlightsError (wall/error response):")
+    traceback.print_exc()
 except Exception:
-    print("Low-level fetch raised:")
+    print("fetch_flights_html raised:")
     traceback.print_exc()
 
 
 # ----------------------------------------------------------------------
-# Block C — the make-or-break probe: cheapest-by-day calendar?
+# Block C — make-or-break: cheapest-by-day / calendar API in 3.0?
 # ----------------------------------------------------------------------
-banner("BLOCK C — is there a cheapest-by-day / calendar / price-graph API?")
+banner("BLOCK C — does 3.0 expose a cheapest-by-day / calendar / price-graph API?")
 
 candidates = [
     n for n in dir(fast_flights)
     if any(kw in n.lower() for kw in ("calendar", "grid", "graph", "date", "price", "cheap"))
 ]
-print("Names in fast_flights that smell like a calendar feature:")
+print("Names that smell like a calendar feature:")
 if candidates:
     for c in candidates:
         print(f"  - {c}")
 else:
-    print("  (NONE — v2.2 has no calendar symbol. get_flights takes a single")
-    print("   date per leg, no range. Step 5 must pre-scan day-by-day or find")
-    print("   another lib. Confirm at https://aweird.me/flights/)")
+    print("  (NONE by name. v2.2 had none; check whether 3.0 changed this.")
+    print("   FlightQuery still takes a single 'date' per leg => step 5 must")
+    print("   pre-scan day-by-day unless a range API exists. Confirm in docs.)")
 
 import inspect  # noqa: E402
 
-print("\nget_flights signature (note: single 'date' per FlightData, no range):")
+print("\ncreate_query signature (note: single 'date' per FlightQuery):")
 try:
-    print(" ", inspect.signature(get_flights))
+    print(" ", inspect.signature(create_query))
 except (TypeError, ValueError):
     print("  <couldn't introspect>")
 
@@ -221,15 +196,13 @@ except (TypeError, ValueError):
 # ----------------------------------------------------------------------
 banner("BLOCK D — detection + cost signals")
 
-print(f"Block A latency: {elapsed:.2f}s (a fast fail ~1s usually = walled, not slow)")
+print(f"Block A latency: {elapsed:.2f}s (a ~1s fast-fail usually = walled, not slow)")
 print(
-    "\nBrowser deps: v2.2 pulls only 'primp' (Rust HTTP client) — no Playwright/\n"
-    "Selenium locally. 'common' = direct HTTP (cheap, no browser RAM). The\n"
-    "'fallback'/'local' modes need a remote/local browser; the hosted fallback\n"
-    "(try.playwright.tech) returns 401 now, so treat 'common' as the only path.\n"
-    "Verify deps with:  uv tree | grep -iE 'playwright|selenium|primp'\n"
+    "\n3.0 fetcher impersonates chrome_145 on macOS with referer=True (a stronger\n"
+    "fingerprint than 2.2's failed chrome_126). Still pure HTTP via primp — no\n"
+    "Playwright/Selenium pulled in, so 'common' fetch = no browser RAM on the\n"
+    "droplet. Verify deps with:  uv tree | grep -iE 'playwright|selenium|primp'\n"
 )
 
-print("\nSmoke test done. Read the blocks top-to-bottom. The key question:")
-print("did Block A or Block B return real flights from the droplet IP?")
-
+print("\nSmoke test done. THE decision line is in Block A (flights vs FlightsError)")
+print("and confirmed by Block B (real HTML vs consent wall).")
