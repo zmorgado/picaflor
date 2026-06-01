@@ -20,5 +20,10 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Allow the git+https direct reference for the fast-flights consent-fix
+# experiment (thoughtpunch fork). Remove once we pin a real PyPI release.
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

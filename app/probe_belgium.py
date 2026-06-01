@@ -27,7 +27,6 @@ Delete once we've seen the numbers.
 
 import random
 import time
-import traceback
 
 from fast_flights import (
     FlightQuery,
@@ -53,19 +52,21 @@ def banner(title: str) -> None:
 
 
 def cheapest_one_way(origin: str, dest: str, date: str):
-    """One live query. Returns (price:int, label:str) for the cheapest flight,
-    or None if no result / blocked. Never raises — a probe should survive one
-    bad leg and keep scanning."""
+    """One live query. Returns (price, url) for the cheapest flight, or None
+    on failure. URL is the Google Flights search link for this leg — the
+    library has no per-itinerary booking URL, but Query.url() gives a search
+    that re-runs the exact same query, with our result at the top. Never
+    raises — a probe should survive one bad leg and keep scanning."""
+    query = create_query(
+        flights=[FlightQuery(date=date, from_airport=origin, to_airport=dest)],
+        seat="economy",
+        trip="one-way",
+        passengers=Passengers(adults=1),
+        currency="EUR",
+    )
+    url = query.url()
     try:
-        results = get_flights(
-            create_query(
-                flights=[FlightQuery(date=date, from_airport=origin, to_airport=dest)],
-                seat="economy",
-                trip="one-way",
-                passengers=Passengers(adults=1),
-                currency="EUR",
-            )
-        )
+        results = get_flights(query)
     except FlightsError:
         print(f"    {origin}->{dest} {date}: FlightsError (wall/block/no data)")
         return None
@@ -77,22 +78,22 @@ def cheapest_one_way(origin: str, dest: str, date: str):
         print(f"    {origin}->{dest} {date}: 0 flights")
         return None
 
-    # results is a MetaList of Flights groups; .price is total EUR for the group.
     cheapest = min(results, key=lambda f: f.price)
-    return cheapest.price
+    return cheapest.price, url
 
 
 def scan(direction: str, pairs):
-    """Run one-way scans for a list of (a, b, date) and collect prices."""
+    """Run one-way scans; collect {(a,b): (price, url)} for legs that returned data."""
     print(f"\n[{direction}] scanning {len(pairs)} legs...")
-    prices = {}
+    legs = {}
     for a, b, date in pairs:
-        price = cheapest_one_way(a, b, date)
-        if price is not None:
-            prices[(a, b)] = price
+        result = cheapest_one_way(a, b, date)
+        if result is not None:
+            price, url = result
+            legs[(a, b)] = (price, url)
             print(f"    {a}->{b} {date}: EUR {price}")
         time.sleep(random.uniform(*DELAY_RANGE))
-    return prices
+    return legs
 
 
 # ----------------------------------------------------------------------
@@ -114,21 +115,69 @@ in_prices = scan("INBOUND", inbound_pairs)  # keys: (dest, origin)
 elapsed = time.perf_counter() - t0
 
 # ----------------------------------------------------------------------
-# In-memory open-jaw combiner: out to city A (from origin O1), back from
-# city B (to origin O2). A != B => true open-jaw. A == B => round-trip.
+# In-memory combiner — rules from design discussion:
+#   - SAME METRO: out-origin and back-origin must both be in {BRU, CRL}.
+#     You have to actually come home to Brussels. (No flying out from BRU
+#     and "home" to Madrid.) Both ORIGINS here are Brussels-area so this
+#     is just "back-origin in ORIGINS" — kept explicit for when origins
+#     span multiple metros in the real code.
+#   - kind:
+#       * round-trip  : A == B (same destination city, regular trip)
+#       * open-jaw    : A != B (out to A, ground-link A->B, back from B)
+#   - GEO FLAG on open-jaw:
+#       * 'ok'   : A and B in the same region table entry — plausible
+#                  ground link (train/bus/short hop).
+#       * 'wild' : A and B in different regions — surfaced but flagged so
+#                  the user can see it's not a realistic city-hop.
+#
+# Region table is intentionally small + hand-rolled; cheap and readable.
 # ----------------------------------------------------------------------
-banner("COMBINER — open-jaw + round-trip pairs, ranked by total price")
+
+# Coarse regions for the destinations we scan. Tune as we add cities.
+REGIONS = {
+    "iberia":       {"AGP", "ALC", "PMI", "FAO"},     # Spain coast + Algarve
+    "central_eu":   {"BUD", "KRK"},                   # Budapest + Krakow
+    "balkans":      {"OTP"},                          # Bucharest
+    "sicily":       {"CTA"},                          # Catania
+}
+
+
+def region_of(code: str) -> str | None:
+    for name, members in REGIONS.items():
+        if code in members:
+            return name
+    return None
+
+
+def open_jaw_flag(dest_a: str, dest_b: str) -> str:
+    ra, rb = region_of(dest_a), region_of(dest_b)
+    if ra and rb and ra == rb:
+        return "ok"        # plausible ground link
+    return "wild"          # different regions — surfaced but flagged
+
+
+banner("COMBINER — same-metro trips, open-jaw + round-trip, geo-flagged")
 
 trips = []
-for (o1, dest_a), out_price in out_prices.items():
-    for (dest_b, o2), in_price in in_prices.items():
+for (o1, dest_a), (out_price, out_url) in out_prices.items():
+    for (dest_b, o2), (in_price, in_url) in in_prices.items():
+        # Same-metro rule: must come home to a Brussels-area airport.
+        if o2 not in ORIGINS:
+            continue
         total = out_price + in_price
-        kind = "round-trip" if dest_a == dest_b else "open-jaw"
+        if dest_a == dest_b:
+            kind, flag = "round-trip", "-"
+        else:
+            kind = "open-jaw"
+            flag = open_jaw_flag(dest_a, dest_b)
         trips.append({
             "kind": kind,
+            "flag": flag,
             "out": f"{o1}->{dest_a}",
             "back": f"{dest_b}->{o2}",
             "total": total,
+            "out_url": out_url,
+            "in_url": in_url,
         })
 
 trips.sort(key=lambda t: t["total"])
@@ -136,17 +185,34 @@ trips.sort(key=lambda t: t["total"])
 if not trips:
     print("No trips assembled — every leg failed. See errors above.")
 else:
-    print(f"Assembled {len(trips)} candidate trips. Top 15 by total price:\n")
-    print(f"  {'#':>2}  {'kind':<10}  {'out':<10}  {'back':<10}  {'total':>8}")
-    print(f"  {'-'*2}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}")
-    for i, t in enumerate(trips[:15], 1):
-        print(f"  {i:>2}  {t['kind']:<10}  {t['out']:<10}  {t['back']:<10}  EUR {t['total']:>4}")
+    print(f"Assembled {len(trips)} same-metro candidates. Top 10 by total price:")
+    print("(URLs are Google Flights search links — your result is at the top of the page.)\n")
+    for i, t in enumerate(trips[:10], 1):
+        print(f"  #{i:<2} {t['kind']:<10} {t['flag']:<5} "
+              f"out {t['out']:<10} back {t['back']:<10}  EUR {t['total']}")
+        print(f"      out link:  {t['out_url']}")
+        print(f"      back link: {t['in_url']}")
+        print()
 
-    # Highlight the best genuine open-jaw (the v0.1 differentiator).
-    best_oj = next((t for t in trips if t["kind"] == "open-jaw"), None)
-    if best_oj:
-        print(f"\nBest OPEN-JAW: out {best_oj['out']}, back {best_oj['back']} "
-              f"= EUR {best_oj['total']}")
+    # The interesting find: cheapest *plausible* open-jaw (kind=open-jaw, flag=ok).
+    # If one beats the cheapest round-trip, that's a real v0.1 differentiator.
+    plausible_oj = [t for t in trips if t["kind"] == "open-jaw" and t["flag"] == "ok"]
+    cheapest_rt = next((t for t in trips if t["kind"] == "round-trip"), None)
+    print()
+    if plausible_oj:
+        best = plausible_oj[0]
+        print(f"Best PLAUSIBLE open-jaw: out {best['out']}, back {best['back']} = EUR {best['total']}")
+        print(f"  out link:  {best['out_url']}")
+        print(f"  back link: {best['in_url']}")
+        if cheapest_rt and best["total"] < cheapest_rt["total"]:
+            saving = cheapest_rt["total"] - best["total"]
+            print(f"  -> beats cheapest round-trip ({cheapest_rt['out']} {cheapest_rt['back']} "
+                  f"EUR {cheapest_rt['total']}) by EUR {saving}.")
+        elif cheapest_rt:
+            print(f"  (cheapest round-trip is still cheaper: {cheapest_rt['out']} "
+                  f"{cheapest_rt['back']} EUR {cheapest_rt['total']})")
+    else:
+        print("No plausible open-jaws found — every A!=B pair crosses regions.")
 
 # ----------------------------------------------------------------------
 banner("PROBE STATS")
